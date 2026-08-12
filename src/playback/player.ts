@@ -289,7 +289,10 @@ export class Player {
           )
           reject(
             new Error(
-              `Event ${event} timed out after ${timeout}ms for guild ${this.guildId}`
+              `Event ${event} timed out after ${timeout}ms for guild ${this.guildId}`,
+              event === 'playerStateChange'
+                ? { cause: 'VOICE_STATE_TIMEOUT' }
+                : undefined
             )
           )
         }, timeout)
@@ -530,7 +533,7 @@ export class Player {
           track: this.track,
           exception: {
             message: 'Voice reconnection circuit breaker triggered',
-            severity: 'fault',
+            severity: 'suspicious',
             cause: 'RECONNECT_CIRCUIT_BREAKER'
           }
         })
@@ -766,8 +769,28 @@ export class Player {
         cause = 'VOICE_CONNECTION_RESET'
         shouldStop = false
       } else if (
+        error.cause === 'VOICE_CONNECTION_TIMEOUT' ||
+        error.message === 'Voice connection timed out'
+      ) {
+        logger(
+          'warn',
+          'Player',
+          `Voice connection timed out for guild ${this.guildId}. Stopping this playback attempt.`
+        )
+        severity = 'suspicious'
+        cause = 'VOICE_CONNECTION_TIMEOUT'
+      } else if (error.cause === 'VOICE_STATE_TIMEOUT') {
+        logger(
+          'warn',
+          'Player',
+          `Voice playback state timed out for guild ${this.guildId}. Stopping this playback attempt.`
+        )
+        severity = 'suspicious'
+        cause = 'VOICE_STATE_TIMEOUT'
+      } else if (
         error.message.includes('stream') ||
         error.message.includes('timeout') ||
+        error.message.includes('timed out') ||
         error.name === 'AbortError'
       ) {
         logger(
@@ -1667,9 +1690,12 @@ export class Player {
     }
 
     if (!this.connection?.udpInfo?.secretKey) {
-      const errorMessage = `Voice connection for guild ${this.guildId} is not ready (missing UDP info). Aborting playback.`
-      logger('error', 'Player', errorMessage)
-      this._onError(new Error(errorMessage))
+      this._onError(
+        new Error(
+          `Voice connection timed out for guild ${this.guildId} (missing UDP info).`,
+          { cause: 'VOICE_CONNECTION_TIMEOUT' }
+        )
+      )
       return false
     }
 
@@ -2402,17 +2428,22 @@ export class Player {
         'Player',
         `Waiting for voice connection to be ready for guild ${this.guildId}`
       )
-      await this.waitEvent(
-        'stateChange',
-        (s: VoiceConnectionState) =>
-          s.status === 'connected' && !!this.connection?.udpInfo?.secretKey
-      )
+      try {
+        await this.waitEvent(
+          'stateChange',
+          (s: VoiceConnectionState) =>
+            s.status === 'connected' && !!this.connection?.udpInfo?.secretKey
+        )
+      } catch {}
     }
 
     if (!this.connection?.udpInfo?.secretKey) {
-      const errorMessage = `Voice connection for guild ${this.guildId} is not ready (missing UDP info). Aborting playback.`
-      logger('error', 'Player', errorMessage)
-      this._onError(new Error(errorMessage))
+      this._onError(
+        new Error(
+          `Voice connection timed out for guild ${this.guildId} (missing UDP info).`,
+          { cause: 'VOICE_CONNECTION_TIMEOUT' }
+        )
+      )
       return false
     }
 

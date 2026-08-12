@@ -62,6 +62,7 @@ import type {
   PlayerManagerConstructor,
   RequestShim,
   RouteExtension,
+  Session,
   SessionSocket,
   SourceExtension,
   TrackModifierExtension,
@@ -92,6 +93,9 @@ type NodeLtsCacheEntry = {
 const NODE_LTS_CREDENTIAL_KEY = 'runtime.node.latestLts'
 const NODE_LTS_CREDENTIAL_TTL_MS = 24 * 60 * 60 * 1000
 const NODE_LTS_MEMORY_TTL_MS = 10 * 60 * 1000
+const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 45000
+const WEBSOCKET_HEARTBEAT_SWEEP_MS = 15000
+const WEBSOCKET_STALE_TIMEOUT_MS = WEBSOCKET_HEARTBEAT_INTERVAL_MS * 2.5
 let latestNodeLtsCache: { value: string | null; expiresAt: number } | null =
   null
 
@@ -525,7 +529,8 @@ class NodelinkServer extends EventEmitter {
   _globalUpdater: NodeJS.Timeout | null
   _statsUpdater: NodeJS.Timeout | null
   supportedSourcesCache: string[] | null
-  _heartbeatInterval: NodeJS.Timeout | null;
+  _heartbeatInterval: NodeJS.Timeout | null
+  _socketHeartbeatStates: WeakMap<SessionSocket, { lastInboundAt: number }>;
   [key: string]: unknown
 
   /**
@@ -615,6 +620,7 @@ class NodelinkServer extends EventEmitter {
     this._statsUpdater = null
     this.supportedSourcesCache = null
     this._heartbeatInterval = null
+    this._socketHeartbeatStates = new WeakMap()
 
     if (this._usingBunServer) {
       // EventEmitter used as WebSocket server shim for Bun
@@ -714,40 +720,96 @@ class NodelinkServer extends EventEmitter {
   }
 
   /**
-   * Starts the heartbeat interval to keep WebSocket connections alive.
-   *
-   * No-op when running under `Bun.serve` because Bun handles WebSocket pings
-   * natively via `websocket.sendPings: true`. Running both would double the
-   * keepalive traffic.
+   * Starts the heartbeat interval and closes sessions that stop answering.
    * @internal
    */
   _startHeartbeat() {
     if (this._heartbeatInterval) return
-    if (this._usingBunServer) return
 
+    let lastPingAt = 0
     this._heartbeatInterval = setInterval(() => {
+      const now = Date.now()
+      const shouldSendPing = now - lastPingAt >= WEBSOCKET_HEARTBEAT_INTERVAL_MS
+      if (shouldSendPing) lastPingAt = now
+
       for (const session of this.sessions.activeSessions.values()) {
-        if (session.socket && !session.isPaused) {
+        const socket = session.socket
+        if (!socket || session.isPaused) continue
+
+        const heartbeatState = this._socketHeartbeatStates.get(socket)
+        if (!heartbeatState) continue
+
+        if (now - heartbeatState.lastInboundAt > WEBSOCKET_STALE_TIMEOUT_MS) {
+          logger(
+            'warn',
+            'Server',
+            `Closing stale WebSocket session ${session.id}: no inbound traffic for ${now - heartbeatState.lastInboundAt}ms.`
+          )
           try {
-            if (typeof session.socket.sendFrame === 'function') {
-              session.socket.sendFrame(Buffer.alloc(0), {
-                len: 0,
-                fin: true,
-                opcode: 0x09
-              })
-            } else if (typeof session.socket.ping === 'function') {
-              session.socket.ping()
+            const immediateSocket = socket as SessionSocket & {
+              terminate?: () => void
             }
-          } catch (_e) {
-            logger(
-              'debug',
-              'Server',
-              `Failed to send heartbeat to session ${session.id}`
-            )
+            if (typeof immediateSocket.terminate === 'function') {
+              immediateSocket.terminate()
+            } else if (typeof socket.destroy === 'function') {
+              socket.destroy()
+            } else {
+              socket.close(4000, 'Heartbeat timeout')
+            }
+          } catch (_closeError) {
+            try {
+              socket.close(4000, 'Heartbeat timeout')
+            } catch {}
           }
+          continue
+        }
+
+        if (!shouldSendPing) continue
+
+        try {
+          if (typeof socket.sendFrame === 'function') {
+            socket.sendFrame(Buffer.alloc(0), {
+              len: 0,
+              fin: true,
+              opcode: 0x09
+            })
+          } else if (typeof socket.ping === 'function') {
+            socket.ping()
+          }
+        } catch (_e) {
+          logger(
+            'debug',
+            'Server',
+            `Failed to send heartbeat to session ${session.id}`
+          )
         }
       }
-    }, 45000)
+    }, WEBSOCKET_HEARTBEAT_SWEEP_MS)
+  }
+
+  /**
+   * Tracks inbound activity for one active session socket.
+   * @param session - Session associated with the socket.
+   * @param socket - Current session socket.
+   * @param addListener - Raw socket listener registration function.
+   * @internal
+   */
+  _trackSessionSocketActivity(
+    session: Session,
+    socket: SessionSocket,
+    addListener: SessionSocket['on']
+  ): void {
+    const heartbeatState = { lastInboundAt: Date.now() }
+    const markInbound = (): void => {
+      if (session.socket === socket && !session.isPaused) {
+        heartbeatState.lastInboundAt = Date.now()
+      }
+    }
+
+    this._socketHeartbeatStates.set(socket, heartbeatState)
+    addListener('message', markInbound)
+    addListener('ping', markInbound)
+    addListener('pong', markInbound)
   }
 
   /**
@@ -947,6 +1009,7 @@ class NodelinkServer extends EventEmitter {
         }
 
         if (session) {
+          this._trackSessionSocketActivity(session, socket, originalOn)
           logger(
             'info',
             'Server',
@@ -1024,6 +1087,10 @@ class NodelinkServer extends EventEmitter {
             socket,
             clientInfo
           )
+          const session = this.sessions.get(sessionId)
+          if (session) {
+            this._trackSessionSocketActivity(session, socket, originalOn)
+          }
 
           const sessionCount = this.sessions.activeSessions?.size || 0
           this.statsManager.setWebsocketConnections(sessionCount)

@@ -254,39 +254,69 @@ export default class PlayerManager {
    * @param guildId - Target guild id.
    * @param command - Command name.
    * @param args - Command argument list.
+   * @param repairMissing - Recreates a missing worker player and retries once.
    * @internal
    */
   private async runClusterPlayerCommand(
     guildId: string,
     command: string,
-    args: readonly unknown[]
+    args: readonly unknown[],
+    repairMissing = false
   ): Promise<PlayerCommandResponse> {
     const session = this.getSessionOrThrow()
     const playerKey = this.getPlayerKey(guildId)
     const workerManager = this.getWorkerManagerOrThrow()
     const worker = workerManager.getWorkerForGuild(playerKey)
+    let missingMessage = 'Player not assigned to a worker.'
 
-    if (!worker) {
-      throw new Error('Player not assigned to a worker.')
-    }
+    if (worker) {
+      const result = await workerManager.execute<PlayerCommandResponse>(
+        worker,
+        'playerCommand',
+        {
+          sessionId: this.sessionId,
+          guildId,
+          userId: this.getSessionUserId(session),
+          command,
+          args: [...args]
+        }
+      )
 
-    const result = await workerManager.execute<PlayerCommandResponse>(
-      worker,
-      'playerCommand',
-      {
-        sessionId: this.sessionId,
-        guildId,
-        userId: this.getSessionUserId(session),
-        command,
-        args: [...args]
+      if (!result?.playerNotFound) {
+        return result
       }
-    )
-
-    if (result?.playerNotFound) {
-      throw new Error('Player not found.')
+      missingMessage = 'Player not found.'
     }
 
-    return result
+    workerManager.unassignGuild(playerKey)
+    this.players.delete(playerKey)
+
+    if (!repairMissing) {
+      throw new Error(missingMessage)
+    }
+
+    logger(
+      'warn',
+      'PlayerManager',
+      `Repairing missing cluster player for guild ${guildId} (session: ${this.sessionId})`
+    )
+    await this.create(guildId)
+    return this.runClusterPlayerCommand(guildId, command, args)
+  }
+
+  /**
+   * Executes a mutating player command and repairs missing worker state once.
+   * @param guildId - Target guild id.
+   * @param command - Command name.
+   * @param args - Command argument list.
+   * @internal
+   */
+  private runClusterMutation(
+    guildId: string,
+    command: string,
+    args: readonly unknown[]
+  ): Promise<PlayerCommandResponse> {
+    return this.runClusterPlayerCommand(guildId, command, args, true)
   }
 
   /**
@@ -562,7 +592,7 @@ export default class PlayerManager {
       return interception.result as PlayerCommandResponse
 
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'play', [trackPayload])
+      return this.runClusterMutation(guildId, 'play', [trackPayload])
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))
@@ -585,7 +615,7 @@ export default class PlayerManager {
       return interception.result as PlayerCommandResponse
 
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'preload', [trackPayload])
+      return this.runClusterMutation(guildId, 'preload', [trackPayload])
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))
@@ -603,7 +633,7 @@ export default class PlayerManager {
       return interception.result as PlayerCommandResponse
 
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'clearNextTrack', [])
+      return this.runClusterMutation(guildId, 'clearNextTrack', [])
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))
@@ -619,7 +649,7 @@ export default class PlayerManager {
       return interception.result as PlayerCommandResponse
 
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'stop', [])
+      return this.runClusterMutation(guildId, 'stop', [])
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))
@@ -642,7 +672,7 @@ export default class PlayerManager {
       return interception.result as PlayerCommandResponse
 
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'pause', [shouldPause])
+      return this.runClusterMutation(guildId, 'pause', [shouldPause])
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))
@@ -667,7 +697,7 @@ export default class PlayerManager {
       return interception.result as PlayerCommandResponse
 
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'seek', [position, endTime])
+      return this.runClusterMutation(guildId, 'seek', [position, endTime])
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))
@@ -686,7 +716,7 @@ export default class PlayerManager {
       return interception.result as PlayerCommandResponse
 
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'volume', [level])
+      return this.runClusterMutation(guildId, 'volume', [level])
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))
@@ -709,9 +739,7 @@ export default class PlayerManager {
       return interception.result as PlayerCommandResponse
 
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'setFilters', [
-        filtersPayload
-      ])
+      return this.runClusterMutation(guildId, 'setFilters', [filtersPayload])
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))
@@ -734,7 +762,7 @@ export default class PlayerManager {
       return interception.result as PlayerCommandResponse
 
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'setFading', [fadingConfig])
+      return this.runClusterMutation(guildId, 'setFading', [fadingConfig])
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))
@@ -749,7 +777,7 @@ export default class PlayerManager {
     enabled: boolean
   ): Promise<boolean | PlayerCommandResponse> {
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'setLoudnessNormalizer', [
+      return this.runClusterMutation(guildId, 'setLoudnessNormalizer', [
         enabled
       ])
     }
@@ -774,9 +802,7 @@ export default class PlayerManager {
       return interception.result as PlayerCommandResponse
 
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'updateVoice', [
-        voicePayload
-      ])
+      return this.runClusterMutation(guildId, 'updateVoice', [voicePayload])
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))
@@ -786,12 +812,15 @@ export default class PlayerManager {
 
   /**
    * Serializes player state to a JSON-compatible object.
+   * @param guildId - Target guild id.
+   * @param repairMissing - Recreates a missing worker player before retrying.
    */
   async toJSON(
-    guildId: string
+    guildId: string,
+    repairMissing = false
   ): Promise<PlayerStateJSON | PlayerCommandResponse> {
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'toJSON', [])
+      return this.runClusterPlayerCommand(guildId, 'toJSON', [], repairMissing)
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))
@@ -807,10 +836,7 @@ export default class PlayerManager {
     volume: number | null = null
   ): Promise<MixAddResult | PlayerCommandResponse> {
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'addMix', [
-        trackPayload,
-        volume
-      ])
+      return this.runClusterMutation(guildId, 'addMix', [trackPayload, volume])
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))
@@ -825,7 +851,7 @@ export default class PlayerManager {
     mixId: string
   ): Promise<boolean | PlayerCommandResponse> {
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'removeMix', [mixId])
+      return this.runClusterMutation(guildId, 'removeMix', [mixId])
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))
@@ -841,7 +867,7 @@ export default class PlayerManager {
     volume: number
   ): Promise<boolean | PlayerCommandResponse> {
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'updateMix', [mixId, volume])
+      return this.runClusterMutation(guildId, 'updateMix', [mixId, volume])
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))
@@ -868,7 +894,7 @@ export default class PlayerManager {
     skipTrackSource: boolean | string | undefined
   ): Promise<PlayerCommandResponse | undefined> {
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'subscribeLyrics', [
+      return this.runClusterMutation(guildId, 'subscribeLyrics', [
         skipTrackSource
       ])
     }
@@ -885,7 +911,7 @@ export default class PlayerManager {
     guildId: string
   ): Promise<PlayerCommandResponse | undefined> {
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'unsubscribeLyrics', [])
+      return this.runClusterMutation(guildId, 'unsubscribeLyrics', [])
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))
@@ -917,9 +943,7 @@ export default class PlayerManager {
     >
   ): Promise<PlayerCommandResponse | undefined> {
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'updateSponsorBlock', [
-        updates
-      ])
+      return this.runClusterMutation(guildId, 'updateSponsorBlock', [updates])
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))
@@ -935,7 +959,7 @@ export default class PlayerManager {
     segments: SponsorBlockSegment[]
   ): Promise<PlayerCommandResponse | undefined> {
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'setSponsorBlockSegments', [
+      return this.runClusterMutation(guildId, 'setSponsorBlockSegments', [
         segments
       ])
     }
@@ -952,7 +976,7 @@ export default class PlayerManager {
     guildId: string
   ): Promise<PlayerCommandResponse | undefined> {
     if (this.isCluster) {
-      return this.runClusterPlayerCommand(guildId, 'clearSponsorBlock', [])
+      return this.runClusterMutation(guildId, 'clearSponsorBlock', [])
     }
 
     const player = this.getLocalPlayerOrThrow(this.getPlayerKey(guildId))

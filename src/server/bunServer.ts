@@ -111,7 +111,7 @@ export class BunSocketWrapper
    * @public
    */
   terminate(): void {
-    this.ws.close(1000, 'Terminated')
+    this.ws.terminate()
   }
 
   /**
@@ -523,7 +523,7 @@ export function createBunServer(
     },
 
     websocket: {
-      sendPings: true,
+      sendPings: false,
       idleTimeout: 120,
       maxPayloadLength: 1024 * 1024 * 16,
       data: {} as BunSocketData,
@@ -611,10 +611,15 @@ export function createBunServer(
         }
         wrapper._handleClose(code, reason)
       },
-      // `error` is documented in Bun.serve docs but missing from
-      // bun-types@1.3.14 typings; cast keeps runtime behaviour while
-      // satisfying the type checker.
+      // `ping`, `pong`, and `error` are supported by Bun but are missing from
+      // bun-types@1.3.14 typings; this cast keeps the runtime handlers typed.
       ...({
+        ping(ws: ServerWebSocket<BunSocketData>, data: Buffer) {
+          ws.data?.wrapper?.emit('ping', data)
+        },
+        pong(ws: ServerWebSocket<BunSocketData>, data: Buffer) {
+          ws.data?.wrapper?.emit('pong', data)
+        },
         error(ws: ServerWebSocket<BunSocketData>, err: Error) {
           logger(
             'error',
